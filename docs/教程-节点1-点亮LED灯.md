@@ -1,233 +1,218 @@
 # 节点一 · 点亮 LED 灯
 
-> **练习模式分工**：资料、截图、讲解、编译烧录命令——AI 已全部备好；**代码你手敲**进
-> `practice` 分支的 `User/main.c`。`main` 分支的 `main.c` 是参考答案（卡壳 15 分钟以上再看）。
->
-> **两库关系一句话**：寄存器版和 HAL 版**思路完全一样**（看图定引脚 → 开时钟 → 配模式 →
-> 操作电平 → 看现象），所以第一节、第二节两版共用；第三节是寄存器版专属、第四节是 HAL 版
-> 专属，各讲各的不同。**先做寄存器版，通过后再做 HAL 版。**
+> **分工**：资料/截图/讲解 AI 备好，代码你手敲（practice 分支），卡壳 15 分钟再看 main 分支参考答案。
+> **两版关系**：寄存器版和 HAL 版思路一样（找灯 → 开时钟 → 配输出 → 亮灭交替），共用的放前面，差异各自章节。
+> **流程**：每版都要 编译 0 错 0 警 → 烧录 → 亲眼看到闪 → git 提交（`1. xxx` 开头）。
 
 ---
 
-## 一、看图说话：这颗灯是怎么接的？（两版共用）
+## 0. 接线
 
-### 1.1 LED 电路——判断高低电平
+| 接什么 | 怎么接 |
+|---|---|
+| DC 电源（必须） | 电源座插适配器（7~24V），**ON 开关拨到 ON** |
+| ST-Link | `SWDIO→SWD`、`SWCLK→SCK`、`GND→GND` 三根（右缘 5 针排针，3V3/RST 不用接） |
+| USB-C | 插 **USB>TTL** 口（串口日志用；旁边的 OTG 口插不插都行） |
 
-![image-20261015094616443](../../../../../AppData/Roaming/Typora/typora-user-images/image-20261015094616443.png)
-
-**怎么读这张图**：这是原理图第 3 页"用户按键和LED"区域（红框部分）。从左往右读：
-
+**自检两条**：
+1. 通电标志：电脑设备管理器出现 CH340 串口号（CH340 吃板载 3V3，板不通电它不出现）。
+2. ST-Link 通不通：
+```bash
+"C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe" -c port=SWD mode=UR
 ```
-网络 LED1 ──→ LED（红色） ──→ 电阻 R9（4.7K） ──→ GND
-```
+   看到 `Device ID : 0x413`（= F407 家族）+ `Device name : STM32F405xx/F407xx...` 就是全通。
 
-信号从 **PD10** 流出，经过 LED，再经 4.7K 电阻进地。**电流方向：PD10 → LED → GND**，
-所以 **PD10 输出高电平（3.3V）灯亮，输出低电平（0V）灯灭**。
+---
 
-三个坑提前排掉：
-1. **和 F103 板相反**！F103 精英板是 3V3→LED→引脚（低电平亮）。本板是引脚→LED→GND（高电平亮）。一切以原理图为准，不要凭旧经验。
-2. 图里元件位号写着 `LED3`，网络名却是 `LED1`——**位号是原理图里的元件编号，网络名是信号名，两码事**。板上丝印是 `LED1`（红灯）。
-3. 4.7K 是限流电阻：电流 ≈ (3.3V − 红灯压降约2V) ÷ 4700Ω ≈ 0.3mA。电流小但足够点亮指示灯。
+## 1. 看图找灯
 
-### 1.2 引脚分配表——确认引脚号
+![LED1 电路](images/sch_p3_led1.png)
+
+**怎么读**：原理图第 3 页。电流方向：PD10 → LED → 4.7K → GND，所以 **PD10 输出高电平灯亮**。
+⚠️ 与 F103 板相反（那块板低电平亮），一切以原理图为准。位号 LED3 ≠ 网络名 LED1，别混。
 
 ![引脚分配](images/sch_p7_led_pin.png)
 
-**怎么读这张图**：原理图第 7 页"引脚分配"表（红框一行）：**网络 `LED1` → 引脚 `PD10`**。
-同列往下：LED2=PD11、LED3=PD12、KEY1/2/3=PD13/14/15（节点二要用，先混个脸熟）。
-
-**节点一结论（已双源核实：坐标提取+视觉读图）**：
-
-| 项目 | 值 |
-|---|---|
-| 目标灯 | 板上丝印 LED1（红色） |
-| 引脚 | **PD10** |
-| 点亮电平 | **高电平** |
+**怎么读**：第 7 页引脚表：**LED1 = PD10**（红灯）。同列：LED2 = PD11（绿）、LED3 = PD12（蓝）、KEY1~3 = PD13~15（节点二用）。
 
 ---
 
-## 二、通用知识：F4 的 GPIO 和 F103 有什么不一样（两版共用）
+## 2. 原理
 
-### 2.1 四步流程不变，寄存器全换了
+**四步流程**（F103 学的方法不变）：确定引脚 → 开时钟 → 配输出 → 亮灭交替。
+**变的是寄存器**（F1 → F4 迁移表）：
 
-方法论**原封不动**：**确定引脚 → 开时钟 → 配模式 → 操作电平 → 现象验证**。
-但寄存器层面 F4 是另一套，迁移时最容易犯"拿旧地图找新大陆"：
-
-| 步骤 | F103（你学过的） | F407（本板的） |
+| 步骤 | F103 | F407 |
 |---|---|---|
-| 开 GPIO 时钟 | `RCC->APB2ENR`（APB2 总线） | `RCC->AHB1ENR`（**换到 AHB1 总线了**） |
-| 配输入/输出 | CRL/CRH，每脚挤 4 个位 | **CRL/CRH 不存在了**，改用 4 个独立寄存器：MODER（方向）/ OTYPER（推挽开漏）/ OSPEEDR（速度）/ PUPDR（上下拉） |
-| 输出电平 | BSRR / BRR / ODR | BSRR（ODR 也有，读改写用） |
+| 开 GPIO 时钟 | `RCC->APB2ENR` | `RCC->AHB1ENR`（换域了） |
+| 配输入/输出 | CRL/CRH 每脚 4 位 | **CRL/CRH 没了**，用 MODER/OTYPER/OSPEEDR/PUPDR 四个寄存器 |
+| 输出电平 | BSRR / BRR / ODR | **只有 BSRR**（BRR 没了，实测踩坑见第 6 节） |
 
-### 2.2 开时钟：AHB1ENR 的第 3 位
+### 2.1 开时钟
 
 ![RCC_AHB1ENR](images/rm_p244_ahb1enr.png)
 
-**怎么读这张图**：RM0090 中文版 PDF 第 244 页，`RCC_AHB1ENR` 位表（红框处）——
-**bit 3 = GPIODEN**（GPIO **D** port clock **EN**able）。写 1 = 给 GPIOD 供电，写 0 = 断电
-（断电状态下写 GPIOD 寄存器无效，这是"外设先开时钟"的根本原因）。
+**怎么读**：RM0090 中文版第 244 页，`RCC_AHB1ENR` 位表——**bit3 = GPIODEN**，写 1 给 GPIOD 供电。
+手册依据：第 243 页（表头、偏移 0x30）+ 第 244 页（位表）。
 
-**手册依据**：RM0090 中文版 PDF 第 243 页（寄存器表头、地址偏移 0x30）+ 第 244 页（位表）。
-
-### 2.3 配模式：MODER 每脚占两位
+### 2.2 配输出
 
 ![GPIOx_MODER](images/rm_p283_moder.png)
 
-**怎么读这张图**：第 283 页 `GPIOx_MODER` 位表（红框处）。**每个引脚占 2 位**：
-`00`=输入、`01`=输出、`10`=复用功能、`11`=模拟。PD10 对应 **MODER10，占 bit[21:20]**。
+**怎么读**：第 283 页 `GPIOx_MODER`——**每脚 2 位**：00 输入 / 01 输出 / 10 复用 / 11 模拟。
+PD10 占 **bit[21:20]**（脚号 × 2 = 起始位；21 是包的高位格，20 是低位格）。
+`1<<20` 把 01 写进包；`1<<21` 会写成 10（复用）——错一位就是另一种模式，编译器不报错。
+复位默认全 0 = 输入模式（**只会听不会说，忘了配这步灯永远不亮**——我们踩过，见第 6 节）。
 
-**怎么算 21:20**：脚号 × 2 = 起始位号。10 × 2 = 20，两位就是 [21:20]。
-（同 F103 的 CRH 格子公式 (n−8)×4 一个道理，只是 F4 每脚从 4 位减到 2 位。）
-
-**手册依据**：RM0090 中文版 PDF 第 283 页。同族寄存器还有：OTYPER（第 281 页，复位值全 0=推挽，不用改）、OSPEEDR（第 282 页，复位值全 0=低速，够用）、PUPDR（第 282 页，复位值全 0=无上下拉）。**复位默认值恰好就是我们要的推挽低速无拉，所以这三个寄存器本节点不用写**——但要心里有数，不是"不存在"。
-
-### 2.4 操作电平：BSRR 置 1 清 0
+### 2.3 亮与灭
 
 ![GPIOx_BSRR](images/rm_p286_bsrr.png)
 
-**怎么读这张图**：第 286 页 `GPIOx_BSRR` 位表。低 16 位 BS0~BS15（红框左）：写 1 = 该脚输出高；
-高 16 位 BR0~BR15（红框右）：写 1 = 该脚输出低。**写 0 无任何作用**，所以置位清零都是"一次写
-完成"，不受干扰——这叫原子操作（F103 的 BSRR 同款，用法没变）。
+**怎么读**：第 286 页 `GPIOx_BSRR`——低 16 位 BSx 写 1 = 输出高；高 16 位 BRx 写 1 = 输出低；写 0 无效。
+本板：`BS10`（bit10）= 亮，`BR10`（bit26）= 灭。一次写完、不读旧值 = **原子操作**（中断插不进来）。
+`|=` 是读-改-写（三条指令），初始化时用没风险，主循环反复翻电平用 BSRR。
+手册依据：第 286 页。
 
-**手册依据**：RM0090 中文版 PDF 第 286 页。
-
-⚠️ **F103 的 BRR 在 F4 上不存在**（实测踩坑：AC5 报 `#136: has no field "BRR"`）。铁证：头文件
-`stm32f407xx.h` 第 526~537 行，GPIO_TypeDef 成员只有 MODER/OTYPER/OSPEEDR/PUPDR/IDR/ODR/BSRR/LCKR/AFR。
-F4 清零只走 BSRR 高 16 位：`GPIOD->BSRR = GPIO_BSRR_BR10`（BR10=bit26）；置位走低 16 位
-`GPIO_BSRR_BS10`（bit10）。头文件里残留的 `GPIO_BRR_BRx` 宏只是兼容别名（指向 BSRR_BRx），别用。
-
-### 2.5 现在芯片跑多快？——延时参数的依据
+### 2.4 延时
 
 ![时钟树](images/rm_p217_clocktree.png)
 
-**怎么读这张图**：第 217 页时钟树。左中位置红框 `16 MHz HSI RC`——内部高速振荡器，出厂固定
-16MHz。复位之后 SYSCLK 的选择开关（图中 SW）默认指向 HSI：**上电 8 个周期后芯片就在
-16MHz 上跑，任何配置都不用做**（F103 复位默认 8MHz HSI，同理）。
-
-![HSI 说明](images/rm_p219_hsi16m.png)
-
-**手册依据**：RM0090 中文版 PDF 第 217 页（时钟树图）、第 219 页 §7.2.2 原话：
-"The HSI clock signal is generated from an internal 16 MHz RC oscillator"。
-
-⚠️ 前瞻：本板外部晶振 8MHz（原理图 X1），以后时钟节点会配 PLL 上 168MHz。**但现在先不碰**——
-16MHz 点灯绰绰有余，而且不依赖晶振实测（板上丝印还没核实）。延时的换算：**1ms = 16000 个时钟**。
+**怎么读**：第 217 页时钟树，复位默认走 **HSI 16MHz**（第 219 页 §7.2.2 原话"internal 16 MHz RC oscillator"）。
+1ms = 16000 个时钟（直连 HCLK）或 2000 个（HCLK÷8，CTRL 不置 bit2）。**两种都行**，参数要跟选的路配套。
+时钟先不配 PLL——等时钟节点再上 168MHz（届时必须实证晶振 8MHz、显式 `HSE_VALUE=8000000`）。
 
 ---
 
-## 三、寄存器版
+## 3. 寄存器版
 
-### 3.1 要碰的寄存器全家福
+**要碰的寄存器**：
 
-| 寄存器 | 地址（怎么来的） | 干什么 | 写什么 |
-|---|---|---|---|
-| `RCC->AHB1ENR` | 0x40023830（RCC 基址 0x40023800 + 偏移 0x30） | 开 GPIOD 时钟 | `1<<3`（bit3=GPIODEN） |
-| `GPIOD->MODER` | 0x40020C00（GPIOD 基址 + 偏移 0x00） | PD10 配输出 | 先清 `[21:20]` 再写 `1<<20` |
-| `GPIOD->BSRR` | 0x40020C18（偏移 0x18） | 亮/灭 | 亮=`1<<10`，灭=`1<<26` |
+| 寄存器 | 地址 | 干什么 |
+|---|---|---|
+| `RCC->AHB1ENR` | 0x40023830 | `|= 1<<3` 开 GPIOD 时钟 |
+| `GPIOD->MODER` | 0x40020C00 | 先 `&= ~(3<<20)` 再 `\|= (1<<20)` 配输出 |
+| `GPIOD->BSRR` | 0x40020C18 | 亮 `1<<10`，灭 `1<<26` |
 
-> GPIOD 基址 0x40020C00 的依据：头文件 `stm32f4xx.h` 中 `#define GPIOD_BASE 0x40020C00U`
-> （GPIOA~E = 0x40020000 起每端口 +0x400）。`GPIOD->MODER` 就是编译器替你算的 0x40020C00。
-
-### 3.2 五步骨架（先想清楚再敲）
-
-1. **开时钟**：AHB1ENR 的 bit3 置 1（读-改-写 `|=`，别把别的位冲掉）
-2. **配输出**：MODER 的 [21:20] **先清 0 再写 01**（"先清后写"防旧值残留——F103 同款习惯）
-3. **延时工具**：SysTick 三寄存器（LOAD/VAL/CTRL），F103 的 delay 原理照搬，**LOAD 填 16000−1**（16MHz÷1000）
-4. **主循环**：BSRR 写 `1<<10` → 延时 → 写 `1<<26` → 延时
-5. 编译 F7 看 `0 Error, 0 Warning` → 烧录 → **看红灯 500ms 节奏**
-
-### 3.3 delay_ms 逐行讲
+**核心代码**（practice 分支手敲；`delay_ms` 用 SysTick，原理同 F103，LOAD 填 16000−1 或 2000−1 看你选哪条路）：
 
 ```c
-static void delay_ms(uint32_t ms)
+int main(void)
 {
-    SysTick->LOAD = 16000U - 1U;   /* 数 16000 个时钟=1ms；-1 因为从"满值"数到 0 含头含尾 */
-    SysTick->VAL  = 0U;            /* 当前值清零，强制从 LOAD 开始数 */
-    SysTick->CTRL = 5U;            /* bit0=使能、bit2=时钟源选 CPU 时钟(16M)，不开中断 */
-    while (ms-- > 0U) {
-        while ((SysTick->CTRL & (1U << 16)) == 0U) { }  /* bit16=COUNTFLAG：数到 0 自动置 1，读后自清 */
+    SystemCoreClockUpdate();                    /* 读当前频率到 SystemCoreClock */
+
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;        /* 开 GPIOD 时钟 */
+
+    GPIOD->MODER &= ~(3UL << 20);               /* 清 [21:20] 旧值 */
+    GPIOD->MODER |=  (1UL << 20);               /* [21:20]=01 输出 */
+
+    GPIOD->BSRR = GPIO_BSRR_BR10;               /* 上电先灭 */
+
+    while (1)
+    {
+        GPIOD->BSRR = GPIO_BSRR_BR10;           /* 灭 */
+        delay_ms(500);
+        GPIOD->BSRR = GPIO_BSRR_BS10;           /* 亮 */
+        delay_ms(500);
     }
-    SysTick->CTRL = 0U;            /* 关表，省电 */
 }
 ```
 
-### 3.4 完整参考代码
+**扩展挑战**（你自己加的，双灯）：PD11 同公式——`3<<22` 清、`1<<22` 写、亮 `BS11` 灭 `BR11`。
 
-**在 `main` 分支 `User/main.c`（GitHub 网页或 `git show main:User/main.c` 可看）**。
-练习规则：不看答案先自己敲，卡壳 15 分钟以上再对照。你敲的是 practice 分支的空模板，
-目标编译 `0 Error(s), 0 Warning(s)`，Program Size 约在 **Code=700B** 上下（比这大很多
-说明思路跑偏了）。
+**验收**：0 错 0 警（Code≈700~800B）→ 红灯 500ms 闪、上电先灭。
 
-### 3.5 编译与烧录
+---
 
-编译：Keil 里按 **F7**。烧录（Git Bash，原样可抄）：
+## 4. HAL 版
 
+**HAL 只是个代办员**，对照表：
+
+| 你写的 | 它替你写的寄存器 |
+|---|---|
+| `__HAL_RCC_GPIOD_CLK_ENABLE()` | `AHB1ENR \|= 1<<3` |
+| `HAL_GPIO_Init(GPIOD, &...)` | MODER/OTYPER/OSPEEDR/PUPDR 四连写 |
+| `HAL_GPIO_WritePin(...SET/RESET)` | BSRR 置位 / 清零 |
+| `HAL_Delay(500)` | SysTick 1ms 中断累计 uwTick 查差值 |
+
+**核心代码**（脚手架 `HAL_Init` 和 SysTick 心跳已在工程里）：
+
+```c
+int main(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  HAL_Init();                     /* SysTick 1ms 心跳 */
+
+  __HAL_RCC_GPIOD_CLK_ENABLE();   /* 开 GPIOD 时钟 */
+
+  GPIO_InitStruct.Pin   = GPIO_PIN_10;          /* PD10 */
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;  /* 推挽输出 */
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);       /* 四连写 */
+
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10, GPIO_PIN_RESET);   /* 上电先灭 */
+
+  while (1)
+  {
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10, GPIO_PIN_RESET);  /* 灭 */
+    HAL_Delay(500);
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10, GPIO_PIN_SET);    /* 亮 */
+    HAL_Delay(500);
+  }
+}
+```
+
+**时钟不用写**：`SystemClock_Config` 以后节点再说。F103 板那份 `HSI/2×16=64MHz` 配置在 F4 上编译不过——
+`RCC_HSE_PREDIV_DIV1`、`RCC_PLL_MUL16` 是 F1 专属宏，直接删。
+
+**验收**：0 错 0 警（Code≈3.2KB）→ 现象与寄存器版一致。
+
+---
+
+## 5. 编译烧录
+
+**铁律四步**：改代码 → **Ctrl+S** → **F7**（重新编译）→ **LOAD**（下载）。
+LOAD **不会**自动编译，不 F7 烧的是旧固件（我们用 700B vs 728B 的体积差抓过现行）。
+
+**首次用 Keil 烧录，先配一次**（魔术棒 = Options for Target，ALT+F7）：
+1. **Debug** 页：下拉框选 **ST-Link Debugger**（默认 ULINK 会报 No ULINK Device）→ Settings → 看到 ST-Link 序列号和 IDCODE 即通，Port = SW
+2. **Flash Download** 页：算法列表有 **STM32F4xx Flash 512KB**（没有点 Add 加）；**勾选 "Reset and Run"** ←★
+3. 确定。以后 LOAD 一键 = 烧录 + 复位 + 开跑
+
+命令行等价（Git Bash，`-rst` = Reset and Run）：
 ```bash
 cd C:/Users/26476/Desktop/F407-Lab/reg/f407-reg-lab/MDK-ARM
 "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe" -c port=SWD mode=UR -w Objects/f407-reg-lab.hex -v -rst
 ```
 
-⚠️ `-rst` 不能省（否则芯片停在暂停态，灯不闪你还会以为代码错了——F103 项目验证过的坑）。
-
-### 3.6 寄存器版验收标准
-
-| 项 | 标准 |
-|---|---|
-| 编译 | 0 Error 0 Warning |
-| 烧录 | CubeProgrammer 报 Verified |
-| 现象 | **LED1 红灯 0.5s 亮 0.5s 灭，节奏均匀**（LED2/LED3 不动） |
-| 体积 | Code≈700B（多了很多说明 F103 的 CRL/CRH 习惯带进来了） |
+**看到现象后提交**：
+```bash
+cd C:/Users/26476/Desktop/F407-Lab/reg/f407-reg-lab
+git add -A && git commit -m "1. 点亮LED灯（寄存器版）" && git push
+```
 
 ---
 
-## 四、HAL 库版（寄存器版通过后再开工）
+## 6. 翻车实录
 
-### 4.1 思路一样，HAL 只是个"代办员"
-
-四步流程不变，只是每步从"你亲手写寄存器"变成"你喊 HAL，它替你写寄存器"。
-**对照表（HAL 调用 ↔ 它实际写进的寄存器）**：
-
-| 你写的 HAL 调用 | HAL 替你写进哪个寄存器 |
-|---|---|
-| `__HAL_RCC_GPIOD_CLK_ENABLE()` | `RCC->AHB1ENR \|= 1<<3`（同 2.2） |
-| `HAL_GPIO_Init(GPIOD, &...)` | 按 4 个字段写 `MODER/OTYPER/OSPEEDR/PUPDR` 四连 |
-| `HAL_GPIO_WritePin(GPIOD, pin, SET/RESET)` | `BSRR = pin` 或 `BSRR = pin<<16`（同 2.4） |
-| `HAL_Delay(500)` | 靠 SysTick **1ms 中断**累计 uwTick 再查差值（寄存器版是轮询 COUNTFLAG，两派原理见 F103 知识卡） |
-
-所以 HAL 版"学什么"？**学两件事**：①初始化用结构体传参的套路（Pin/Mode/Pull/Speed 四字段）
-②`HAL_Delay` 为什么依赖 SysTick 中断（顺带明白：**中断里调 HAL_Delay 会死等**——uwTick 不走了）。
-
-### 4.2 工程与练习场
-
-- 工程：`C:\Users\26476\Desktop\F407-Lab\hal\f407-hal-lab\MDK-ARM\f407-hal-lab.uvprojx`
-- HAL 仓库同样两分支：`practice`（你敲）+ `main`（参考答案）
-- 脚手架已给（`HAL_Init()`、`stm32f4xx_it.c` 的 SysTick 心跳、`MX_GPIO_Init` 空壳）；
-  **你要写**：MX_GPIO_Init 里开时钟+结构体四字段+HAL_GPIO_Init，以及主循环亮灭交替
-
-### 4.3 HAL 版验收标准
-
-| 项 | 标准 |
-|---|---|
-| 编译 | 0 Error 0 Warning |
-| 现象 | 与寄存器版**完全一致**（红灯 0.5s 节奏） |
-| 体积 | Code≈3196B（参考答案实测）——对比寄存器 700B，体会 HAL 的代价 |
+| 现象 | 真因 | 解法 |
+|---|---|---|
+| 编译 0 错，灯不亮 | 代码没配 MODER，PD10 还是输入模式（寄存器读数：AHB1ENR bit3=1 但 MODER=0，钉死） | 补“先清后写”两行；学会读寄存器破案 |
+| 改了代码，烧完还是老现象 | LOAD 不自动编译，烧进的是旧 hex（体积 700B vs 728B 暴露） | **F7 之后再 LOAD** |
+| 烧录成功，灯全灭 | 烧完芯片停在暂停态（Keil 没勾 Reset and Run / 命令行没 -rst） | 勾上它 / 命令带 -rst |
+| 编译报 `has no field "BRR"` | F103 的 BRR 寄存器 F4 上不存在 | 清零用 `GPIO_BSRR_BR10`（BSRR 高 16 位） |
+| HAL 报 `RCC_HSE_PREDIV_DIV1` 未定义 | F1 专属宏，F4 没有 | 删 SystemClock_Config（本节点不需要时钟配置） |
+| 绿灯很暗 | 绿光 LED 压降 ≈3.0V（红光 ≈2.0V），同 4.7K 电阻电流只有红灯 1/4 | 正常物理现象，不是 bug |
+| 灯接 PD10 写成 PC13/GPIOC | F103 板的 LED 在 PC13，肌肉记忆 | 一切以本板原理图为准 |
 
 ---
 
-## 五、验收总表（节点一完成后填提交号）
+## 7. 验收
 
 | 腿 | 编译 | 现象 | 体积 | 提交 |
 |---|---|---|---|---|
-| 寄存器 | ☐ 0错0警 | ☐ 红灯500ms | ☐ ≈700B | ☐ `1. 点亮LED灯（寄存器版）` |
-| HAL | ☐ 0错0警 | ☐ 红灯500ms | ☐ ≈3196B | ☐ `1. 点亮LED灯（HAL库版）` |
+| 寄存器 | ✅ 0错0警 | ✅ 红灯500ms闪+自扩展双灯 | 784B | `1. 点亮LED灯（寄存器版）` |
+| HAL | ✅ 0错0警 | ✅ 红灯500ms闪 | 3188B | `1. 点亮LED灯（HAL库版）` |
 
-**提交信息格式**（两个仓库各自提交）：`1. 点亮LED灯（寄存器版）` / `1. 点亮LED灯（HAL库版）`
-——节点编号开头，这是我们的仓库规矩。
-
----
-
-## 附：本节踩坑预告（AI 埋雷区，遇到了别慌）
-
-- 灯完全不亮：先查 BSRR 是不是写成了 ODR 的地址（偏移 0x14 vs 0x18）
-- 灯常亮不闪：delay 里 COUNTFLAG 位（bit16）没等对，或 CTRL 的 bit2 忘了置（时钟源错）
-- 编译器报 `GPIOD` 未定义：头文件必须是 `stm32f4xx.h`，且工程宏 `STM32F407xx`（模板已配好）
-- 烧录成功但全无反应：99% 是忘了 `-rst`
+**下一步**：节点二 · 按键（KEY1~3 = PD13~15，低电平有效）。
