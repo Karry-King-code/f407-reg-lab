@@ -26,16 +26,72 @@
 
 #include "stm32f4xx.h"
 
+void delay_ms(uint32_t ms)
+{
+    uint32_t tick = SystemCoreClock / 8 / 1000;
+    SysTick->LOAD = tick - 1;
+    SysTick->VAL  = 0;
+    SysTick->CTRL = SysTick_CTRL_ENABLE_Msk;
+    while (ms--)
+        while ((SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk) == 0)
+        {
+        }
+    SysTick->CTRL = 0;
+}
+
+uint8_t key_pressed(void)
+{
+    static uint8_t last = 1;                     /* 上次状态（static 跨调用记忆） */
+    uint8_t now = (GPIOD->IDR & GPIO_IDR_ID13) ? 1 : 0;   /* 读 IDR bit13：0=按下 1=松开 */
+    uint8_t evt  = 0;
+
+    if (last == 1 && now == 0)                   /* 1 -> 0 = 按下沿 */
+    {
+        delay_ms(10);                            /* 按下消抖 */
+        if ((GPIOD->IDR & GPIO_IDR_ID13) == 0)    /* 抖完仍是 0 = 真按下 */
+        {
+            evt = 1;
+            while ((GPIOD->IDR & GPIO_IDR_ID13) == 0)
+            {
+            }                                    /* 等松手 */
+            delay_ms(10);                        /* 释放消抖 */
+        }
+    }
+    last = now;
+    return evt;
+}
+
 int main(void)
 {
+	   uint8_t  running = 0;
+	   uint16_t slice   = 0;
+	   SystemCoreClockUpdate(); 
     /* ① 开 GPIOD 时钟 */
-
+     RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
     /* ② PD13 配输入：清 [27:26]（输入=00，清完不用写1） */
-
+     GPIOD->MODER &= ~(3UL << 26);                            
     /* ③ PD10 配输出 + 上电先灭（节点一的代码） */
-
+     GPIOD->MODER &= ~(3UL << 20);               
+     GPIOD->MODER |=  (1UL << 20);
+	   GPIOD->BSRR = GPIO_BSRR_BR10;
     while (1)
     {
         /* ④ 读 IDR 的 bit13：=0 按下（LED1 亮），=1 松开（LED1 灭） */
+			 if (key_pressed())                       /* 每片开头照看按键 */
+        {
+            running = !running;                  /* 开 <-> 停 */
+            if (running == 0)
+                GPIOD->BSRR = GPIO_BSRR_BR10;    /* 停止：灯灭 */
+        }
+        if (running)
+        {
+            if (++slice >= 50)                   /* 50 片 x 10ms = 500ms */
+            {
+                slice = 0;
+                GPIOD->ODR ^= GPIO_ODR_OD10;     /* 翻转：ODR 异或 bit13（本工程无中断，读改写安全） */
+            }
+        }
+        delay_ms(10);                            /* 节拍器 */
     }
+    
 }
