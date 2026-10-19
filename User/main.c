@@ -23,33 +23,17 @@
 
 #include "stm32f4xx.h"
 
-volatile uint32_t g_rx_count = 0;            /* 已收字节数（调试器可读） */
+#define BUF_LEN  64
+volatile uint8_t  rbuf[BUF_LEN];
+volatile uint16_t rhead = 0, rtail = 0;      /* 写指针 / 读指针 */
 
-void delay_ms(uint32_t ms)
+void USART1_IRQHandler (void)
 {
-    uint32_t tick = SystemCoreClock / 8 / 1000;
-    SysTick->LOAD = tick - 1;
-    SysTick->VAL  = 0;
-    SysTick->CTRL = SysTick_CTRL_ENABLE_Msk;
-    while (ms--)
-        while ((SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk) == 0)
-        {
-        }
-    SysTick->CTRL = 0;
-}
-
-static void uart1_send(uint8_t b)
-{
-    while ((USART1->SR & USART_SR_TXE) == 0)
-    {
-    }
-    USART1->DR = b;
-}
-
-static void uart1_str(const char *s)
-{
-    while (*s)
-        uart1_send((uint8_t)*s++);
+ if(USART1->SR & USART_SR_RXNE)
+ {
+  rbuf[rhead] = USART1->DR;
+	rhead = (rhead + 1)% BUF_LEN;
+ }
 }
 int main(void)
 {
@@ -73,17 +57,20 @@ int main(void)
     /* ④ USART1->CR1：UE + TE + RE */
     USART1->CR1 |= USART_CR1_UE;
     USART1->CR1 |= USART_CR1_TE | USART_CR1_RE;
-	
-	  uart1_str("\r\n=== STM32F407 USART1 READY - REG (115200-8-N-1) ===\r\n");
-    uart1_str("Type anything, I will echo it back. LED toggles per byte.\r\n");
+	  USART1->CR1 = USART_CR1_RXNEIE;
+		
     while (1)
     {
         /* ⑤ if (SR 有 RXNE) { c = DR; 等 TXE; DR = c; } */
-			if (USART1->SR & USART_SR_RXNE)      /* bit5：收到字节 */
-        {
-            uint8_t b = (uint8_t)USART1->DR; /* 读 DR 自动清 RXNE */
-            uart1_send(b);                   /* 原样发回 */
-            g_rx_count++;
-         }
-    }
+			if(rhead != rtail)
+			{
+				uint8_t c = rbuf[rtail];
+				rtail = (rtail + 1) % BUF_LEN;
+				while (!(USART1->SR & USART_SR_TXE)) { }
+				USART1->DR = c;             
+			}
+			
+			
+			
+			  }
 }
