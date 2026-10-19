@@ -1,76 +1,46 @@
 /*
- * 节点 3 · 串口收发（练习版 · 空白模板）
+ * 节点 4 · I2C 读写 EEPROM（AT24C02）（练习版 · 空白模板）
  *
- * 硬件事实（原理图第 3/7 页已核实）：
- *   USART1：TX = PA9 → 板上 CH340N 的 RX（电脑收）；RX = PA10 ← CH340N 的 TX（电脑发）
- *   你插着的 USB>TTL 口就是串口，不需要任何额外接线。串口助手设置：115200-8-N-1
+ * 硬件事实（原理图第 4/7 页已核实）：
+ *   AT24C02 EEPROM：SCL = PB10、SDA = PB11 —— 正好是硬件 I2C2 的引脚（AF4）
+ *   器件地址：0xA0（写）/ 0xA1（读），容量 256 字节，掉电不丢
+ *   （I2C 是总线：SCL 由主机打拍子，SDA 双向传数据；两根线都靠上拉，空闲为高）
  *
  * 目标现象（版本 A）：
- *   电脑串口助手发什么字节，板子原样发回什么（echo 回显）
- *   版本 B（进阶）：中断接收 + 环形缓冲（F103 铁律：轮询会丢字节）
+ *   向 EEPROM 某地址写一个字节 → 读回来 → 两值相等 = 读写闭环
+ *   结果可从串口看（把节点三的串口初始化和发送函数搬进来一起用）
  *
- * 步骤骨架：
- *   ① 开两个时钟（串口跨两条总线！）：GPIOA = AHB1ENR bit0，USART1 = APB2ENR bit4
- *   ② PA9/PA10 配"复用"：MODER 每脚 2 位写 10（不是 01 输出了！引脚让给外设）
- *      再在 AFRH 里选 AF7（串口功能）：PA9 → [7:4]=0111，PA10 → [11:8]=0111
- *   ③ 波特率：BRR = 0x8B（16MHz ÷ 16 ÷ 115200 = 8.6875 → 整数 8、小数 0.6875×16≈11）
- *   ④ CR1 同一次写 UE(bit13) + TE(bit3) + RE(bit2)
- *   ⑤ 循环：等 RXNE 收一字节 → 等 TXE 发回同一字节（echo）
+ * 步骤骨架（F407 的 I2C 是老式外设：CR1/CR2/DR/SR1/SR2/CCR）：
+ *   ① 开时钟：GPIOB = AHB1ENR bit1，I2C2 = APB1ENR bit22
+ *   ② PB10/PB11 复用 AF4：MODER [21:20]=10、[23:22]=10；AFR[1] [11:8]=0100、[15:12]=0100
+ *   ③ I2C2->CR2 = 16        （告诉 I2C：输入时钟是 16MHz，用于内部时序）
+ *      I2C2->CCR = 80       （100kHz 标准模式：16M ÷ (2×100k) = 80）
+ *      I2C2->TRISE = 17     （最大上升时间 1000ns，换算成 16MHz 周期数 +1）
+ *      I2C2->CR1 |= PE      （外设总开关）
+ *   ④ 写流程：START位 → 等 SB → 发 0xA0 → 等 ADDR → 读 SR1+SR2 清 ADDR →
+ *             发数据字节 → 等 BTF → 发 STOP
+ *   ⑤ 读流程：同上发到目标地址后 → 重新 START → 发 0xA1 → 等 ADDR → 清 →
+ *             收字节（最后一个发 NACK）→ STOP
  *
- * 新概念：复用功能（MODER=10 + AFRH 选 AF7）、波特率除法（BRR）、状态位轮询（TXE/RXNE）
- * 教材：总文档"节点三 · 串口"章（每步都有截图和推导）
+ * 新概念：I2C 总线协议（起始/地址/应答/停止）、多从机共享两根线
+ * 教材：总文档"节点四"章（下一步写好；先按本模板骨架敲，卡壳问我）
  */
 
 #include "stm32f4xx.h"
 
-#define BUF_LEN  64
-volatile uint8_t  rbuf[BUF_LEN];
-volatile uint16_t rhead = 0, rtail = 0;      /* 写指针 / 读指针 */
-
-void USART1_IRQHandler (void)
-{
- if(USART1->SR & USART_SR_RXNE)
- {
-  rbuf[rhead] = USART1->DR;
-	rhead = (rhead + 1)% BUF_LEN;
- }
-}
 int main(void)
 {
     SystemCoreClockUpdate();
 
-    /* ① 开两个时钟：GPIOA（AHB1ENR bit0）+ USART1（APB2ENR bit4） */
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;     /* ① GPIOA 时钟（AHB1 bit0） */
-    RCC->APB2ENR |= RCC_APB2ENR_USART1EN;    /* ① USART1 时钟（APB2 bit4） */
-	
-    /* ② PA9/PA10：MODER [19:18]=10、[21:20]=10（复用）；AFRH [7:4]=0111、[11:8]=0111（AF7） */
-    GPIOA->MODER &= ~(3UL << 18); 
-    GPIOA->MODER |=  (2UL << 18);	
-    GPIOA->MODER &= ~(3UL << 20);         
-    GPIOA->MODER |=  (2UL << 20);          /* 再写 01 */
-	
-	  GPIOA->AFR[1] &= ~(0xFUL << 4);  GPIOA->AFR[1] |= (7UL << 4);   /* PA9 = AF7 */
-    GPIOA->AFR[1] &= ~(0xFUL << 8);  GPIOA->AFR[1] |= (7UL << 8);   /* PA10 = AF7 */
-	
-    /* ③ USART1->BRR = 0x8B */
-	  USART1->BRR = 0x8B;
-    /* ④ USART1->CR1：UE + TE + RE */
-    USART1->CR1 |= USART_CR1_UE;
-    USART1->CR1 |= USART_CR1_TE | USART_CR1_RE;
-	  USART1->CR1 = USART_CR1_RXNEIE;
-		
+    /* ① 开时钟：GPIOB（AHB1 bit1）+ I2C2（APB1ENR bit22） */
+
+    /* ② PB10/PB11 复用 AF4：MODER + AFR[1] */
+
+    /* ③ I2C2 时序三件套：CR2=16、CCR=80、TRISE=17，最后 CR1 |= PE */
+
+    /* ④⑤ 写一个字节再读回来（流程见上），把结果存到变量（或用节点三的串口打出来） */
+
     while (1)
     {
-        /* ⑤ if (SR 有 RXNE) { c = DR; 等 TXE; DR = c; } */
-			if(rhead != rtail)
-			{
-				uint8_t c = rbuf[rtail];
-				rtail = (rtail + 1) % BUF_LEN;
-				while (!(USART1->SR & USART_SR_TXE)) { }
-				USART1->DR = c;             
-			}
-			
-			
-			
-			  }
+    }
 }
