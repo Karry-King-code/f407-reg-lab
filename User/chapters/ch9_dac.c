@@ -93,6 +93,8 @@ static uint16_t adc_read_ch4(void)
 
 int main(void)
 {
+    static const uint16_t steps[3] = {0, 2048, 4095};
+    uint8_t i;
     uint16_t set, got;
     uint32_t mv_set, mv_got;
 
@@ -106,8 +108,9 @@ int main(void)
     while (1)
     {
         /* 三档循环：0V / 1.65V / 3.3V */
-        for (set = 0; set < 4096; set = (uint16_t)(set + 2048))
+        for (i = 0; i < 3; i++)
         {
+            set = steps[i];
             dac_set(set);
             delay_ms(20);                       /* 等输出稳定 */
             got = adc_read_ch4();
