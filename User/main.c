@@ -1,26 +1,55 @@
 /*
- * 节点 7 · LVGL 移植（寄存器版）
+ * 节点 8 · ADC（寄存器版）—— 读芯片内部温度 + 内部基准
  *
- * 硬件：ST7789 240x320（同节点六：SCK=PB3 MOSI=PB5 DC=PB0 CS=PA15 RST=PC7 LED=PB1）
- * LVGL：v8.3.11，16 位色，大端（LV_COLOR_16_SWAP=1）
+ * 不用接任何线！STM32F407 内置：
+ *   ADC1_IN16 = 芯片温度传感器（手摸芯片温度上升，读数变大）
+ *   ADC1_IN17 = VREFINT 内部基准 1.21V（验证 ADC 精度用）
  *
- * 三个移植要点：
- *   ① flush 回调：LVGL 画好一块后叫你把像素刷到屏上
- *   ② tick：LVGL 的"心跳"，主循环里 lv_tick_inc(5) 喂
- *   ③ 主循环必须调 lv_timer_handler()（LVGL 的"大脑"，不调就永远不动）
+ * 硬件事实（RM0090）：
+ *   ADC 时钟 = PCLK2 / 分频（CCR.ADCPRE），APB2=16MHz → /2 = 8MHz（上限 36MHz）
+ *   分辨率 12 位：0~4095 对应 0~VDDA(3.3V)
+ *   温度换算：T = (V25 − Vsense) / Avg_Slope + 25，V25≈0.76V，Avg_Slope≈2.5mV/°C
+ *   温度传感器/VREFINT 必须开 CR2.TSVREFE，且采样时间要够长（≥10us，这里 480 周期≈60us）
+ *
+ * 现象：串口每 500ms 打印一次温度；手指按住芯片 10 秒，温度明显上升
  */
 
 #include "stm32f4xx.h"
-#include "lvgl.h"
 
-/* ============ ST7789（节点六驱动，精简版） ============ */
-#define CS_L()    (GPIOA->BSRR = (1UL << 15) << 16)
-#define CS_H()    (GPIOA->BSRR = (1UL << 15))
-#define DC_L()    (GPIOB->BSRR = (1UL << 0) << 16)
-#define DC_H()    (GPIOB->BSRR = (1UL << 0))
-#define RST_L()   (GPIOC->BSRR = (1UL << 7) << 16)
-#define RST_H()   (GPIOC->BSRR = (1UL << 7))
-#define LED_ON()  (GPIOB->BSRR = (1UL << 1))
+/* ============ 串口（节点三） ============ */
+static void uart1_send(uint8_t b)
+{
+    while ((USART1->SR & USART_SR_TXE) == 0) { }
+    USART1->DR = b;
+}
+
+static void uart1_str(const char *s)
+{
+    while (*s) uart1_send((uint8_t)*s++);
+}
+
+static void uart1_u32(uint32_t v)
+{
+    char buf[12];
+    int i = 0;
+    if (v == 0) { uart1_send('0'); return; }
+    while (v) { buf[i++] = (char)('0' + v % 10U); v /= 10U; }
+    while (i) uart1_send((uint8_t)buf[--i]);
+}
+
+static void uart_init(void)
+{
+    SystemCoreClockUpdate();
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB2ENR |= RCC_APB2ENR_USART1EN;
+    GPIOA->MODER &= ~(3UL << 18);  GPIOA->MODER |= (2UL << 18);
+    GPIOA->MODER &= ~(3UL << 20);  GPIOA->MODER |= (2UL << 20);
+    GPIOA->AFR[1] &= ~(0xFUL << 4);  GPIOA->AFR[1] |= (7UL << 4);
+    GPIOA->AFR[1] &= ~(0xFUL << 8);  GPIOA->AFR[1] |= (7UL << 8);
+    USART1->BRR = 0x8B;
+    USART1->CR1 |= USART_CR1_UE;
+    USART1->CR1 |= USART_CR1_TE | USART_CR1_RE;
+}
 
 static void delay_ms(uint32_t ms)
 {
@@ -33,139 +62,70 @@ static void delay_ms(uint32_t ms)
     SysTick->CTRL = 0;
 }
 
-static void spi_init(void)
+/* ============ ADC1 ============ */
+static void adc_init(void)
 {
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN;
-    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
 
-    GPIOB->MODER &= ~((3UL << 6) | (3UL << 8) | (3UL << 10));
-    GPIOB->MODER |=  (2UL << 6) | (2UL << 8) | (2UL << 10);
-    GPIOB->AFR[0] &= ~((0xFUL << 12) | (0xFUL << 16) | (0xFUL << 20));
-    GPIOB->AFR[0] |=  (5UL << 12) | (5UL << 16) | (5UL << 20);
+    ADC->CCR = ADC_CCR_ADCPRE_0;          /* PCLK2/2 = 8MHz（ADC 时钟上限 36MHz） */
 
-    GPIOB->MODER &= ~((3UL << 0) | (3UL << 2));
-    GPIOB->MODER |=  (1UL << 0) | (1UL << 2);
-    GPIOA->MODER &= ~(3UL << 30);  GPIOA->MODER |= (1UL << 30);
-    GPIOC->MODER &= ~(3UL << 14);  GPIOC->MODER |= (1UL << 14);
+    ADC1->CR1 = 0;                         /* 12 位、单通道、右对齐 */
+    /* 通道 16/17 采样时间 480 周期（SMP=111） */
+    ADC1->SMPR1 |= (7UL << 18) | (7UL << 21);
+    ADC1->SQR1 = 0;                        /* 序列长度 1 */
 
-    CS_H(); DC_H();
-
-    SPI1->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI;
-    SPI1->CR1 |= SPI_CR1_SPE;
+    ADC1->CR2 = ADC_CR2_ADON;              /* 开 ADC */
+    delay_ms(10);                          /* 稳定时间 */
+    /* ★TSVREFE 在 F4 的 ADC_CCR bit23（F103 在 ADC_CR2！RM0090 p415 原文） */
+    ADC->CCR |= (1UL << 23);
+    delay_ms(10);                          /* 传感器启动时间 */
 }
 
-static uint8_t spi_tx(uint8_t b)
+static uint16_t adc_read(uint8_t ch)
 {
-    while (!(SPI1->SR & SPI_SR_TXE)) { }
-    SPI1->DR = b;
-    while (!(SPI1->SR & SPI_SR_RXNE)) { }
-    return (uint8_t)SPI1->DR;
-}
-
-static void lcd_cmd(uint8_t c) { CS_L(); DC_L(); spi_tx(c); CS_H(); }
-static void lcd_data(uint8_t d) { CS_L(); DC_H(); spi_tx(d); CS_H(); }
-
-static void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
-{
-    lcd_cmd(0x2A);
-    lcd_data((uint8_t)(x0 >> 8)); lcd_data((uint8_t)(x0 & 0xFF));
-    lcd_data((uint8_t)(x1 >> 8)); lcd_data((uint8_t)(x1 & 0xFF));
-    lcd_cmd(0x2B);
-    lcd_data((uint8_t)(y0 >> 8)); lcd_data((uint8_t)(y0 & 0xFF));
-    lcd_data((uint8_t)(y1 >> 8)); lcd_data((uint8_t)(y1 & 0xFF));
-    lcd_cmd(0x2C);
-}
-
-static void lcd_init(void)
-{
-    RST_H(); delay_ms(10);
-    RST_L(); delay_ms(20);
-    RST_H(); delay_ms(120);
-
-    lcd_cmd(0x01); delay_ms(150);
-    lcd_cmd(0x11); delay_ms(120);
-    lcd_cmd(0x3A); lcd_data(0x55);
-    lcd_cmd(0x36); lcd_data(0x00);
-    lcd_cmd(0x20);                  /* 反色关（节点六实测） */
-    lcd_cmd(0x13);
-    lcd_cmd(0x29); delay_ms(20);
-}
-
-/* ============ LVGL 移植 ============ */
-
-#define LCD_W 240
-#define LCD_H 320
-
-static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf1[LCD_W * 20];      /* 20 行缓冲：240*20*2 = 9.6KB */
-static lv_disp_drv_t disp_drv;
-
-/* ① flush：LVGL 每画好一块就调这里，把这块像素刷到屏幕 */
-static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p)
-{
-    uint32_t w = (uint32_t)(area->x2 - area->x1 + 1);
-    uint32_t h = (uint32_t)(area->y2 - area->y1 + 1);
-    uint32_t i, n = w * h;
-
-    lcd_set_window((uint16_t)area->x1, (uint16_t)area->y1,
-                   (uint16_t)area->x2, (uint16_t)area->y2);
-    CS_L(); DC_H();
-    for (i = 0; i < n; i++)
-    {
-        uint16_t c = color_p[i].full;
-        spi_tx((uint8_t)(c >> 8));       /* 大端：高字节先 */
-        spi_tx((uint8_t)(c & 0xFF));
-    }
-    CS_H();
-
-    lv_disp_flush_ready(drv);            /* 告诉 LVGL：这块刷完了 */
-}
-
-/* 建一个简单界面：深色背景 + 标题 + 进度条 */
-static void ui_create(void)
-{
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x102040), 0);
-
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "F407 + LVGL 8.3");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-
-    lv_obj_t *sub = lv_label_create(scr);
-    lv_label_set_text(sub, "ST7789 240x320");
-    lv_obj_set_style_text_color(sub, lv_color_hex(0x80C0FF), 0);
-    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 55);
-
-    lv_obj_t *bar = lv_bar_create(scr);
-    lv_obj_set_size(bar, 180, 18);
-    lv_obj_align(bar, LV_ALIGN_CENTER, 0, 40);
-    lv_bar_set_value(bar, 65, LV_ANIM_OFF);
+    ADC1->SQR3 = ch;                       /* 序列第 1 个 = 通道 ch */
+    ADC1->CR2 |= ADC_CR2_SWSTART;          /* 软件启动转换 */
+    while (!(ADC1->SR & ADC_SR_EOC)) { }   /* 等转换完成 */
+    return (uint16_t)ADC1->DR;             /* 读 DR 自动清 EOC */
 }
 
 int main(void)
 {
-    spi_init();
-    LED_ON();
-    lcd_init();
+    uint16_t raw_t, raw_vref;
+    uint32_t mv_t, mv_vref, temp_x10;
 
-    lv_init();                           /* LVGL 内核启动 */
-    lv_disp_draw_buf_init(&draw_buf, buf1, NULL, LCD_W * 20);
+    uart_init();
+    adc_init();
 
-    lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res  = LCD_W;
-    disp_drv.ver_res  = LCD_H;
-    disp_drv.flush_cb = disp_flush;
-    disp_drv.draw_buf = &draw_buf;
-    lv_disp_drv_register(&disp_drv);     /* 注册显示设备 */
-
-    ui_create();
+    uart1_str("\r\n=== ADC INTERNAL TEST ===\r\n");
+    uart1_str("(touch the chip, temperature rises)\r\n");
 
     while (1)
     {
-        lv_tick_inc(5);                  /* ② 喂心跳（5ms） */
-        lv_timer_handler();              /* ③ 跑 LVGL 的活 */
-        delay_ms(5);
+        raw_t    = adc_read(16);           /* 通道 16 = 温度传感器 */
+        raw_vref = adc_read(17);           /* 通道 17 = VREFINT */
+
+        mv_t    = (uint32_t)raw_t    * 3300UL / 4095UL;
+        mv_vref = (uint32_t)raw_vref * 3300UL / 4095UL;
+
+        /* T(°C) = (V25 - Vsense)/Avg_Slope + 25
+           整数运算：T*10 = (760 - mV) * 4 + 250 */
+        temp_x10 = (uint32_t)((760 - (int32_t)mv_t) * 4 + 250);
+
+        uart1_str("TEMP_RAW=");
+        uart1_u32(raw_t);
+        uart1_str("  mV=");
+        uart1_u32(mv_t);
+        uart1_str("  T=");
+        uart1_u32(temp_x10 / 10);
+        uart1_send('.');
+        uart1_u32(temp_x10 % 10);
+        uart1_str("C   VREF_RAW=");
+        uart1_u32(raw_vref);
+        uart1_str("  mV=");
+        uart1_u32(mv_vref);
+        uart1_str("\r\n");
+
+        delay_ms(500);
     }
 }
