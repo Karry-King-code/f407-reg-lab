@@ -56,8 +56,8 @@ void uart_init(void)
 
 /* ============ SPI1 ============ */
 
-#define CS_L()   (GPIOA->BSRR = (1UL << 4))
-#define CS_H()   (GPIOA->BSRR = (1UL << 4) << 16)
+#define CS_L()   (GPIOA->BSRR = (1UL << 4) << 16)   /* BSRR 高16位=复位=输出低=选中 */
+#define CS_H()   (GPIOA->BSRR = (1UL << 4))         /* BSRR 低16位=置位=输出高=释放 */
 
 static void spi1_init(void)
 {
