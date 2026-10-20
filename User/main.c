@@ -1,194 +1,165 @@
 /*
- * 节点 5 · SPI 读写 Flash（W25Q16）—— 寄存器版（硬件 SPI1）
- *
- * 硬件事实（原理图第 4/7 页已核实）：
- *   W25Q16 SPI Flash（2MB，JEDEC ID 应为 EF 40 15）
- *   CS=PA4（普通 GPIO 片选）、SCK=PA5、MISO=PA6、MOSI=PA7（硬件 SPI1，AF5）
- *   SPI 模式 0（CPOL=0 CPHA=0），片选低电平有效
- *
- * 功能：
- *   ① 读 JEDEC ID：发 0x9F 收 3 字节，应为 EF 40 15
- *   ② 扇区擦除（4KB）→ 页编程写入 "F407" → 读回比对 → PASS
- *
- * 新概念：SPI 是四线全双工（收发同时进行——发一个字节必然收一个字节），
- * 全双工的代价是"读也要发哑字节 0xFF 造时钟"。
+ * 回测：硬件 I2C2 外设 + STOP 等 BUSY + ACK 轮询
+ * 目的：证明硬件外设可用，此前失败是自己代码缺两点。
  */
 
 #include "stm32f4xx.h"
 
-/* ============ 串口（节点三） ============ */
-
-void uart1_send(uint8_t b)
-{
-    while ((USART1->SR & USART_SR_TXE) == 0) { }
-    USART1->DR = b;
-}
-
-void uart1_str(const char *s)
-{
-    while (*s)
-        uart1_send((uint8_t)*s++);
-}
-
-void uart1_hex(uint8_t v)
-{
-    const char h[] = "0123456789ABCDEF";
-    uart1_send((uint8_t)h[v >> 4]);
-    uart1_send((uint8_t)h[v & 0x0F]);
-}
+void uart1_send(uint8_t b) { while ((USART1->SR & USART_SR_TXE) == 0) { } USART1->DR = b; }
+void uart1_str(const char *s) { while (*s) uart1_send((uint8_t)*s++); }
+void uart1_hex(uint8_t v) { const char h[] = "0123456789ABCDEF"; uart1_send((uint8_t)h[v >> 4]); uart1_send((uint8_t)h[v & 0x0F]); }
 
 void uart_init(void)
 {
     SystemCoreClockUpdate();
-
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
     RCC->APB2ENR |= RCC_APB2ENR_USART1EN;
-
     GPIOA->MODER &= ~(3UL << 18);  GPIOA->MODER |= (2UL << 18);
     GPIOA->MODER &= ~(3UL << 20);  GPIOA->MODER |= (2UL << 20);
     GPIOA->AFR[1] &= ~(0xFUL << 4);  GPIOA->AFR[1] |= (7UL << 4);
     GPIOA->AFR[1] &= ~(0xFUL << 8);  GPIOA->AFR[1] |= (7UL << 8);
-
     USART1->BRR = 0x8B;
     USART1->CR1 |= USART_CR1_UE;
     USART1->CR1 |= USART_CR1_TE | USART_CR1_RE;
 }
 
-/* ============ SPI1 ============ */
-
-#define CS_L()   (GPIOA->BSRR = (1UL << 4))
-#define CS_H()   (GPIOA->BSRR = (1UL << 4) << 16)
-
-static void spi1_init(void)
+static void busy_wait_ms(void)        /* 约 2ms 粗延时 */
 {
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;     /* GPIOA 时钟（已在 uart_init 开过，幂等） */
-    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;      /* SPI1 时钟（APB2 bit12） */
-
-    GPIOA->MODER &= ~(3UL << 8);   GPIOA->MODER |= (1UL << 8);    /* PA4 输出（CS） */
-    GPIOA->MODER &= ~((3UL << 10) | (3UL << 12) | (3UL << 14));
-    GPIOA->MODER |= (2UL << 10) | (2UL << 12) | (2UL << 14);      /* PA5/6/7 复用 10 */
-    GPIOA->AFR[0] &= ~(0xFUL << 20); GPIOA->AFR[0] |= (5UL << 20); /* PA5 AF5 */
-    GPIOA->AFR[0] &= ~(0xFUL << 24); GPIOA->AFR[0] |= (5UL << 24); /* PA6 AF5 */
-    GPIOA->AFR[0] &= ~(0xFUL << 28); GPIOA->AFR[0] |= (5UL << 28); /* PA7 AF5 */
-
-    CS_H();                                  /* 片选空闲高 */
-
-    SPI1->CR1 = SPI_CR1_MSTR                 /* 主机 */
-              | SPI_CR1_SSM | SPI_CR1_SSI    /* 软件管片选 + 内部 NSS 拉高 */
-              ;                              /* BR=000：fPCLK2/2 = 8MHz；CPOL=0 CPHA=0 模式0 */
-    SPI1->CR1 |= SPI_CR1_SPE;                /* 使能（最后开） */
+    volatile uint32_t n = 60000;
+    while (n--) { __asm("nop"); }
 }
 
-static uint8_t spi_txrx(uint8_t b)         /* 全双工：发一字节，同时收回一字节 */
+static uint8_t i2c_wait_busy(void)    /* 等 BUSY 清零（STOP 真正完成） */
 {
-    while (!(SPI1->SR & SPI_SR_TXE)) { }   /* 等发送缓冲空 */
-    SPI1->DR = b;
-    while (!(SPI1->SR & SPI_SR_RXNE)) { }  /* 等收到（移位完成） */
-    return (uint8_t)SPI1->DR;
-}
-
-/* ============ W25Q16 协议层 ============ */
-
-static void flash_write_enable(void)
-{
-    CS_L();
-    spi_txrx(0x06);
-    CS_H();
-}
-
-static uint8_t flash_wait_busy(void)       /* 轮询状态寄存器 bit0（擦写中=1），带超时 */
-{
-    uint32_t t = 1000000;
-    uint8_t sr;
-    CS_L();
-    spi_txrx(0x05);
-    do {
-        sr = spi_txrx(0xFF);
-    } while ((sr & 0x01) && --t);
-    CS_H();
+    uint32_t t = 200000;
+    while ((I2C2->SR2 & I2C_SR2_BUSY) && --t) { }
     return t ? 1 : 0;
 }
 
-static uint32_t flash_read_jedec(void)
+static uint8_t i2c_wait_flag(uint32_t flag)
 {
-    uint32_t id;
-    CS_L();
-    spi_txrx(0x9F);
-    id  = (uint32_t)spi_txrx(0xFF) << 16;
-    id |= (uint32_t)spi_txrx(0xFF) << 8;
-    id |= (uint32_t)spi_txrx(0xFF);
-    CS_H();
-    return id;
+    uint32_t t = 200000;
+    while (!(I2C2->SR1 & flag) && --t) { }
+    return t ? 1 : 0;
 }
 
-static uint8_t flash_erase_sector(void)    /* 擦 0 地址所在 4KB 扇区 */
+static void i2c_init(void)
 {
-    flash_write_enable();
-    CS_L();
-    spi_txrx(0x20);
-    spi_txrx(0x00); spi_txrx(0x00); spi_txrx(0x00);   /* 24 位地址 */
-    CS_H();
-    return flash_wait_busy();              /* 典型 45~300ms */
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
+    RCC->APB1ENR |= RCC_APB1ENR_I2C2EN;
+
+    GPIOB->MODER &= ~(3UL << 20);  GPIOB->MODER |= (2UL << 20);
+    GPIOB->MODER &= ~(3UL << 22);  GPIOB->MODER |= (2UL << 22);
+    GPIOB->OTYPER |= (3UL << 10);                       /* 开漏 */
+    GPIOB->AFR[1] &= ~(0xFUL << 8);  GPIOB->AFR[1] |= (4UL << 8);
+    GPIOB->AFR[1] &= ~(0xFUL << 12); GPIOB->AFR[1] |= (4UL << 12);
+
+    RCC->APB1RSTR |=  RCC_APB1RSTR_I2C2RST;
+    RCC->APB1RSTR &= ~RCC_APB1RSTR_I2C2RST;
+
+    I2C2->CR2   = 16;
+    I2C2->CCR   = 80;
+    I2C2->TRISE = 17;
+    I2C2->CR1  |= I2C_CR1_PE;
+
+    /* 等外设落地（F4 已知：PE 置位后 BUSY 可能滞留一会儿） */
+    {
+        uint32_t t = 200000;
+        while ((I2C2->SR2 & I2C_SR2_BUSY) && --t) { }
+    }
 }
 
-static uint8_t flash_prog_page(const uint8_t *d, uint8_t len)   /* 页编程（≤256 字节） */
+/* 写一个字节：流程结束等 BUSY 清零 */
+static uint8_t hw_write(uint8_t mem, uint8_t data)
 {
-    uint8_t i;
-    flash_write_enable();
-    CS_L();
-    spi_txrx(0x02);
-    spi_txrx(0x00); spi_txrx(0x00); spi_txrx(0x00);
-    for (i = 0; i < len; i++)
-        spi_txrx(d[i]);
-    CS_H();
-    return flash_wait_busy();              /* 典型 0.7~3ms */
+    if (!i2c_wait_busy()) return 0;                    /* ★前一道门：总线空闲才开工 */
+
+    I2C2->CR1 |= I2C_CR1_START;
+    if (!i2c_wait_flag(I2C_SR1_SB)) return 0;
+    (void)I2C2->SR1;
+    I2C2->DR = 0xA0;
+    if (!i2c_wait_flag(I2C_SR1_ADDR)) return 0;
+    (void)I2C2->SR1; (void)I2C2->SR2;
+    I2C2->DR = mem;
+    if (!i2c_wait_flag(I2C_SR1_TXE)) return 0;
+    I2C2->DR = data;
+    if (!i2c_wait_flag(I2C_SR1_BTF)) return 0;
+    I2C2->CR1 |= I2C_CR1_STOP;
+    if (!i2c_wait_busy()) return 0;                    /* ★后一道门：等 STOP 真正落地 */
+    return 1;
 }
 
-static void flash_read_data(uint8_t *out, uint8_t len)
+/* ACK 轮询：反复敲门直到芯片写完（= 重新应答） */
+static void hw_wait_ready(void)
 {
-    uint8_t i;
-    CS_L();
-    spi_txrx(0x03);
-    spi_txrx(0x00); spi_txrx(0x00); spi_txrx(0x00);
-    for (i = 0; i < len; i++)
-        out[i] = spi_txrx(0xFF);           /* 读：发哑字节造时钟 */
-    CS_H();
+    uint16_t t = 100;
+    while (t--)
+    {
+        if (!i2c_wait_busy()) return;
+        I2C2->CR1 |= I2C_CR1_START;
+        if (!i2c_wait_flag(I2C_SR1_SB)) { I2C2->CR1 |= I2C_CR1_STOP; return; }
+        (void)I2C2->SR1;
+        I2C2->DR = 0xA0;
+        if (i2c_wait_flag(I2C_SR1_ADDR)) {
+            (void)I2C2->SR1; (void)I2C2->SR2;
+            I2C2->CR1 |= I2C_CR1_STOP;
+            i2c_wait_busy();
+            return;                                    /* 应答了 = 写完了 */
+        }
+        I2C2->CR1 |= I2C_CR1_STOP;
+        i2c_wait_busy();
+        busy_wait_ms();
+    }
 }
 
-/* ============ 主线 ============ */
+static uint8_t hw_read(uint8_t mem, uint8_t *out)
+{
+    if (!i2c_wait_busy()) return 0;
+
+    I2C2->CR1 |= I2C_CR1_ACK;
+    I2C2->CR1 |= I2C_CR1_START;
+    if (!i2c_wait_flag(I2C_SR1_SB)) return 0;
+    (void)I2C2->SR1;
+    I2C2->DR = 0xA0;
+    if (!i2c_wait_flag(I2C_SR1_ADDR)) return 0;
+    (void)I2C2->SR1; (void)I2C2->SR2;
+    I2C2->DR = mem;
+    if (!i2c_wait_flag(I2C_SR1_TXE)) return 0;
+    if (!i2c_wait_flag(I2C_SR1_BTF)) return 0;         /* ★等字节真正发完再重复起始 */
+
+    I2C2->CR1 |= I2C_CR1_START;
+    if (!i2c_wait_flag(I2C_SR1_SB)) return 0;
+    (void)I2C2->SR1;
+    I2C2->DR = 0xA1;
+    if (!i2c_wait_flag(I2C_SR1_ADDR)) return 0;
+    I2C2->CR1 &= ~I2C_CR1_ACK;                         /* 单字节：NACK */
+    (void)I2C2->SR1; (void)I2C2->SR2;
+    if (!i2c_wait_flag(I2C_SR1_RXNE)) return 0;
+    I2C2->CR1 |= I2C_CR1_STOP;
+    *out = I2C2->DR;
+    i2c_wait_busy();
+    return 1;
+}
 
 int main(void)
 {
-    uint32_t id;
-    uint8_t rd[4] = {0};
-    const uint8_t wr[4] = {'F', '4', '0', '7'};
-    uint8_t i, ok = 1;
+    uint8_t rd = 0;
+    uint8_t w1, r1;
 
     uart_init();
-    spi1_init();
+    i2c_init();
 
-    uart1_str("\r\n=== SPI1 W25Q16 TEST (reg) ===\r\n");
+    uart1_str("\r\n=== AT24C02 HW-I2C2 RETEST ===\r\n");
 
-    id = flash_read_jedec();
-    uart1_str("JEDEC=0x");
-    uart1_hex((uint8_t)(id >> 16));
-    uart1_hex((uint8_t)(id >> 8));
-    uart1_hex((uint8_t)id);
-    if (id == 0xEF4015UL) uart1_str("  ID-PASS\r\n");
-    else                  uart1_str("  ID-FAIL\r\n");
+    w1 = hw_write(0x00, 0x5A);
+    hw_wait_ready();                                   /* ACK 轮询（替代死等） */
+    r1 = hw_read(0x00, &rd);
 
-    ok &= flash_erase_sector();
-    ok &= flash_prog_page(wr, 4);
-    flash_read_data(rd, 4);
-
-    uart1_str("READ=");
-    for (i = 0; i < 4; i++)
-        uart1_send(rd[i]);
-    uart1_str("  ");
-    for (i = 0; i < 4; i++)
-        if (rd[i] != wr[i]) ok = 0;
-    if (ok) uart1_str("PASS\r\n");
-    else    uart1_str("FAIL\r\n");
+    uart1_str("W:"); uart1_hex(w1);
+    uart1_str("  R:"); uart1_hex(r1);
+    uart1_str("  RD=0x"); uart1_hex(rd);
+    if (w1 && r1 && rd == 0x5A) uart1_str("  PASS(HW-I2C2 OK)\r\n");
+    else                        uart1_str("  FAIL\r\n");
 
     while (1) { }
 }
