@@ -1,37 +1,30 @@
 /*
- * 节点 8 · ADC（寄存器版）—— 读芯片内部温度 + 内部基准
+ * 节点 9 · DAC（寄存器版）—— 输出 + ADC 内部回读自测
  *
- * 不用接任何线！STM32F407 内置：
- *   ADC1_IN16 = 芯片温度传感器（手摸芯片温度上升，读数变大）
- *   ADC1_IN17 = VREFINT 内部基准 1.21V（验证 ADC 精度用）
+ * 硬件冲突说明：
+ *   DAC_OUT1 = PA4，PA4 同时是 Flash 的 CS（节点五用过）。
+ *   本节点 DAC 驱动 PA4 时，Flash 的 CS 会跟着 DAC 电压走——但 SPI1 没时钟，
+ *   Flash 不会响应，安全。测完切回节点五代码即可恢复。
+ *
+ * 自测闭环（不用接线）：
+ *   PA4 同时是 DAC1_OUT1 和 ADC1_IN4 —— 写 DAC，立刻用 ADC 读回同一根脚。
  *
  * 硬件事实（RM0090）：
- *   ADC 时钟 = PCLK2 / 分频（CCR.ADCPRE），APB2=16MHz → /2 = 8MHz（上限 36MHz）
- *   分辨率 12 位：0~4095 对应 0~VDDA(3.3V)
- *   温度换算：T = (V25 − Vsense) / Avg_Slope + 25，V25≈0.76V，Avg_Slope≈2.5mV/°C
- *   温度传感器/VREFINT 必须开 CR2.TSVREFE，且采样时间要够长（≥10us，这里 480 周期≈60us）
+ *   DAC 在 APB1（bit29），输出 = VREF+ × DHR / 4095，本板 VREF+ = 3.3V
+ *   DAC1 通道使能 = DAC_CR.EN1；数据写 DHR12R1（12 位右对齐）
+ *   PA4 必须配成模拟模式（MODER=11），DAC 和 ADC 共用这根脚
  *
- * 现象：串口每 500ms 打印一次温度；手指按住芯片 10 秒，温度明显上升
+ * 现象：串口每 500ms 打印三组：DAC设定值 vs ADC实测值，两者应接近
  */
 
 #include "stm32f4xx.h"
 
-/* ============ 串口（节点三） ============ */
-static void uart1_send(uint8_t b)
-{
-    while ((USART1->SR & USART_SR_TXE) == 0) { }
-    USART1->DR = b;
-}
-
-static void uart1_str(const char *s)
-{
-    while (*s) uart1_send((uint8_t)*s++);
-}
-
+/* ============ 串口 ============ */
+static void uart1_send(uint8_t b) { while ((USART1->SR & USART_SR_TXE) == 0) { } USART1->DR = b; }
+static void uart1_str(const char *s) { while (*s) uart1_send((uint8_t)*s++); }
 static void uart1_u32(uint32_t v)
 {
-    char buf[12];
-    int i = 0;
+    char buf[12]; int i = 0;
     if (v == 0) { uart1_send('0'); return; }
     while (v) { buf[i++] = (char)('0' + v % 10U); v /= 10U; }
     while (i) uart1_send((uint8_t)buf[--i]);
@@ -62,70 +55,77 @@ static void delay_ms(uint32_t ms)
     SysTick->CTRL = 0;
 }
 
-/* ============ ADC1 ============ */
+/* ============ DAC1 ============ */
+static void dac_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB1ENR |= RCC_APB1ENR_DACEN;          /* DAC 在 APB1 bit29 */
+
+    GPIOA->MODER |= (3UL << 8);                 /* PA4 = 模拟模式 11（DAC/ADC 共用） */
+
+    DAC->CR = DAC_CR_EN1;                       /* 通道 1 使能，不用触发，不用缓冲 */
+}
+
+static void dac_set(uint16_t v)
+{
+    DAC->DHR12R1 = v;                           /* 12 位右对齐：Vout = 3.3V × v/4095 */
+}
+
+/* ============ ADC1（只为回读 PA4） ============ */
 static void adc_init(void)
 {
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
-
-    ADC->CCR = ADC_CCR_ADCPRE_0;          /* PCLK2/2 = 8MHz（ADC 时钟上限 36MHz） */
-
-    ADC1->CR1 = 0;                         /* 12 位、单通道、右对齐 */
-    /* 通道 16/17 采样时间 480 周期（SMP=111） */
-    ADC1->SMPR1 |= (7UL << 18) | (7UL << 21);
-    ADC1->SQR1 = 0;                        /* 序列长度 1 */
-
-    ADC1->CR2 = ADC_CR2_ADON;              /* 开 ADC */
-    delay_ms(10);                          /* 稳定时间 */
-    /* ★TSVREFE 在 F4 的 ADC_CCR bit23（F103 在 ADC_CR2！RM0090 p415 原文） */
-    ADC->CCR |= (1UL << 23);
-    delay_ms(10);                          /* 传感器启动时间 */
+    ADC->CCR = ADC_CCR_ADCPRE_0;                /* PCLK2/2 = 8MHz */
+    ADC1->CR1 = 0;
+    ADC1->SMPR2 |= (7UL << 12);                 /* 通道 4（PA4）采样 480 周期：bits14:12 */
+    ADC1->SQR1 = 0;
+    ADC1->CR2 = ADC_CR2_ADON;
+    delay_ms(10);
 }
 
-static uint16_t adc_read(uint8_t ch)
+static uint16_t adc_read_ch4(void)
 {
-    ADC1->SQR3 = ch;                       /* 序列第 1 个 = 通道 ch */
-    ADC1->CR2 |= ADC_CR2_SWSTART;          /* 软件启动转换 */
-    while (!(ADC1->SR & ADC_SR_EOC)) { }   /* 等转换完成 */
-    return (uint16_t)ADC1->DR;             /* 读 DR 自动清 EOC */
+    ADC1->SQR3 = 4;                             /* 通道 4 = PA4 */
+    ADC1->CR2 |= ADC_CR2_SWSTART;
+    while (!(ADC1->SR & ADC_SR_EOC)) { }
+    return (uint16_t)ADC1->DR;
 }
 
 int main(void)
 {
-    uint16_t raw_t, raw_vref;
-    uint32_t mv_t, mv_vref, temp_x10;
+    uint16_t set, got;
+    uint32_t mv_set, mv_got;
 
     uart_init();
+    dac_init();
     adc_init();
 
-    uart1_str("\r\n=== ADC INTERNAL TEST ===\r\n");
-    uart1_str("(touch the chip, temperature rises)\r\n");
+    uart1_str("\r\n=== DAC LOOPBACK TEST ===\r\n");
+    uart1_str("DAC_OUT1=PA4 (also ADC1_IN4)\r\n");
 
     while (1)
     {
-        raw_t    = adc_read(16);           /* 通道 16 = 温度传感器 */
-        raw_vref = adc_read(17);           /* 通道 17 = VREFINT */
+        /* 三档循环：0V / 1.65V / 3.3V */
+        for (set = 0; set < 4096; set = (uint16_t)(set + 2048))
+        {
+            dac_set(set);
+            delay_ms(20);                       /* 等输出稳定 */
+            got = adc_read_ch4();
 
-        mv_t    = (uint32_t)raw_t    * 3300UL / 4095UL;
-        mv_vref = (uint32_t)raw_vref * 3300UL / 4095UL;
+            mv_set = (uint32_t)set * 3300UL / 4095UL;
+            mv_got = (uint32_t)got * 3300UL / 4095UL;
 
-        /* T(°C) = (V25 - Vsense)/Avg_Slope + 25
-           整数运算：T*10 = (760 - mV) * 4 + 250 */
-        temp_x10 = (uint32_t)((760 - (int32_t)mv_t) * 4 + 250);
-
-        uart1_str("TEMP_RAW=");
-        uart1_u32(raw_t);
-        uart1_str("  mV=");
-        uart1_u32(mv_t);
-        uart1_str("  T=");
-        uart1_u32(temp_x10 / 10);
-        uart1_send('.');
-        uart1_u32(temp_x10 % 10);
-        uart1_str("C   VREF_RAW=");
-        uart1_u32(raw_vref);
-        uart1_str("  mV=");
-        uart1_u32(mv_vref);
-        uart1_str("\r\n");
-
+            uart1_str("DAC_SET=");
+            uart1_u32(set);
+            uart1_str(" (");
+            uart1_u32(mv_set);
+            uart1_str("mV)   ADC_READ=");
+            uart1_u32(got);
+            uart1_str(" (");
+            uart1_u32(mv_got);
+            uart1_str("mV)\r\n");
+        }
+        uart1_str("---\r\n");
         delay_ms(500);
     }
 }
