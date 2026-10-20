@@ -20,7 +20,7 @@ STM32F407 主控板 V1.0（嘉立创 EDA，原理图 7 页，导师提供）：
 | 1 | 点亮 LED 灯（PD10 高电平亮，含双灯扩展） | ✅ 寄存器784B / HAL 3188B |
 | 2 | 按键控制 LED（KEY1=PD13 低有效，按键开关闪烁） | ✅ 寄存器848B / HAL 3336B |
 | 3 | 串口收发（echo+中断环形缓冲） | ✅ 寄存器 / HAL 双腿 |
-| 4 | I2C（AT24C02=硬件I2C2 PB10/11；AHT20=软件I2C PE2/3） | - |
+| 4 | I2C 读写 EEPROM | ✅ 位带 1864B / HAL 26680B 双 PASS |
 | 5 | SPI（W25Q16=硬件SPI1 PA4-7） | - |
 | 6 | 屏幕（ST7789 SPI：SCK=PB3/MOSI=PB5/DC=PB0/CS=PA15/RST=PC7/LED=PB1） | - |
 | 7 | LVGL 移植 | - |
